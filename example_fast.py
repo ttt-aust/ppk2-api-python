@@ -6,7 +6,7 @@ The basic ampere mode sequence is:
 2. set ampere mode
 3. read stream of data
 """
-import time
+
 from ppk2_api.ppk2_api import PPK2_API
 
 ppk2s_connected = PPK2_API.list_devices()
@@ -27,21 +27,39 @@ ppk2_test.start_measuring()  # start measuring
 # the number of measurements in one sampling period depends on the wait between serial reads
 # it appears the maximum number of bytes received is 1024
 # the sampling rate of the PPK2 is 100 samples per millisecond
-for i in range(0, 1000):
-    read_data = ppk2_test.get_data()
-    if read_data != b'':
-        samples = ppk2_test.get_samples(read_data)
-        print(f"Average of {len(samples)} samples is: {sum(samples)/len(samples)}uA")
-    time.sleep(0.01)
+from time import time, sleep 
+start = time()
+slow_print = time()
+sample_count = 0
+
+import csv
+import numpy as np
+with open("fast_test.csv", 'w', newline='') as fast_file:
+
+    while True:
+        read_data = ppk2_test.get_data()
+        if read_data != b'':
+            samples = ppk2_test.get_samples_fast(read_data)
+            #print(f"Average of {len(samples)} samples is: {sum(samples)/len(samples)}uA")
+            sample_count += len(samples)
+            stry = lambda x: f'{x:.3f}\n'
+            sample_strings = np.vectorize(stry)(samples)
+            fast_file.writelines(sample_strings)
+
+        if (time() - slow_print) > 3:
+            print(f'Averaging {sample_count / (time() - slow_print)} samples per second')
+            slow_print = time()
+            sample_count = 0
+    #time.sleep(0.01)
 
 ppk2_test.toggle_DUT_power("ON")
 
 ppk2_test.start_measuring()
 for i in range(0, 1000):
-    read_data = ppk2_test.get_data()
+    read_data = ppk2_test.get_data_32()
     if read_data != b'':
         samples = ppk2_test.get_samples(read_data)
         print(f"Average of {len(samples)} samples is: {sum(samples)/len(samples)}uA")
-    time.sleep(0.001)  # lower time between sampling -> less samples read in one sampling period
+    sleep(0.001)  # lower time between sampling -> less samples read in one sampling period
 
 ppk2_test.stop_measuring()

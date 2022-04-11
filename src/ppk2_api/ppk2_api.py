@@ -11,7 +11,8 @@ import logging
 import os
 import queue
 import multiprocessing
-
+import numpy as np
+ 
 class PPK2_Command():
     """Serial command opcodes"""
     NO_OP = 0x00
@@ -65,6 +66,19 @@ class PPK2_API():
             "IA": None
         }
 
+        self.modifiers_fast = {
+            "Calibrated": None,
+            "R": {0: 1031.64, 1: 101.65, 2: 10.15, 3: 0.94, 4: 0.043},
+            "GS": {0: 1, 1: 1, 2: 1, 3: 1, 4: 1},
+            "GI": {0: 1, 1: 1, 2: 1, 3: 1, 4: 1},
+            "O": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0},
+            "S": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0},
+            "I": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0},
+            "UG": {0: 1, 1: 1, 2: 1, 3: 1, 4: 1},
+            "HW": None,
+            "IA": None
+        }
+
         self.vdd_low = 800
         self.vdd_high = 5000
 
@@ -90,6 +104,8 @@ class PPK2_API():
 
         # adc measurement buffer remainder and len of remainder
         self.remainder = {"sequence": b'', "len": 0}
+
+        self.get_data_32_leftovers = b''
 
     def __del__(self):
         """Destructor"""
@@ -185,6 +201,13 @@ class PPK2_API():
         mask = self._twos_comp(mask)
         return {"mask": mask, "pos": pos}
 
+    def _get_masked_values_fast(self, values, meas):
+        masked_values = np.right_shift(  np.bitwise_and(values, meas["mask"]), meas["pos"]  )
+        if meas["pos"] == 24:
+            # Make sure 255 ends up being -1
+            masked_values = np.array(masked_values, dtype=np.int8)
+        return masked_values
+
     def _get_masked_value(self, value, meas):
         masked_value = (value & meas["mask"]) >> meas["pos"]
         if meas["pos"] == 24:
@@ -192,11 +215,27 @@ class PPK2_API():
                 masked_value = -1
         return masked_value
 
+    def _handle_raw_data_fast(self, adc_values):
+        """Converts integer samples to analog values very quickly."""
+        try:
+            current_measurement_ranges = self._get_masked_values_fast(adc_values, self.MEAS_RANGE)
+            no_greater_than_4 = np.max(current_measurement_ranges)
+            if no_greater_than_4 > 4:
+                raise Exception(f'measurement range out of range: {no_greater_than_4}')
+            adc_results = self._get_masked_values_fast(adc_values, self.MEAS_ADC) * 4
+            bits = self._get_masked_values_fast(adc_values, self.MEAS_LOGIC)
+            analog_values = self.get_adc_results_fast(current_measurement_ranges, adc_results) * 1_000_000
+            return analog_values
+        except Exception as e:
+            print(f"Measurement out of range when trying to decode range: {e}")
+            raise e
+            return None
+
+
     def _handle_raw_data(self, adc_value):
         """Convert raw value to analog value"""
         try:
-            current_measurement_range = min(self._get_masked_value(
-                adc_value, self.MEAS_RANGE), 4)  # 5 is the number of parameters
+            current_measurement_range = min(self._get_masked_value(adc_value, self.MEAS_RANGE), 4)  # 5 is the number of parameters
             adc_result = self._get_masked_value(adc_value, self.MEAS_ADC) * 4
             bits = self._get_masked_value(adc_value, self.MEAS_LOGIC)
             analog_value = self.get_adc_result(
@@ -218,7 +257,8 @@ class PPK2_API():
 
     def get_data(self):
         """Return readings of one sampling period"""
-        sampling_data = self.ser.read(self.ser.in_waiting)
+        waiting = self.ser.in_waiting
+        sampling_data = self.ser.read(waiting - (waiting % 4))
         return sampling_data
 
     def get_modifiers(self):
@@ -267,14 +307,71 @@ class PPK2_API():
         self.mode = PPK2_Modes.SOURCE_MODE
         self._write_serial((PPK2_Command.SET_POWER_MODE,
                             PPK2_Command.AVG_NUM_SET))  # 17,2
+    
+    # self.modifiers_fast = {
+    #         "Calibrated": None,
+    #         "R": {0: 1031.64, 1: 101.65, 2: 10.15, 3: 0.94, 4: 0.043},
+    #         "GS": {0: 1, 1: 1, 2: 1, 3: 1, 4: 1},
+    #         "GI": {0: 1, 1: 1, 2: 1, 3: 1, 4: 1},
+    #         "O": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0},
+    #         "S": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0},
+    #         "I": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0},
+    #         "UG": {0: 1, 1: 1, 2: 1, 3: 1, 4: 1},
+    #         "HW": None,
+    #         "IA": None
+    #     }
+
+    def get_adc_results_fast(self, current_ranges, adc_values):
+        # This is messy but it works...
+        r = lambda x: self.modifiers_fast["R"][x] 
+        R_values = np.vectorize(r)(current_ranges)
+        o = lambda x: self.modifiers_fast["O"][x] 
+        O_values = np.vectorize(o)(current_ranges)
+        s = lambda x: self.modifiers_fast["S"][x] 
+        S_values = np.vectorize(s)(current_ranges)
+        i = lambda x: self.modifiers_fast["I"][x] 
+        I_values = np.vectorize(i)(current_ranges)
+
+        ug = lambda x: self.modifiers_fast["UG"][x] 
+        UG_values = np.vectorize(ug)(current_ranges)
+        gs = lambda x: self.modifiers_fast["GS"][x] 
+        GS_values = np.vectorize(gs)(current_ranges)
+        gi = lambda x: self.modifiers_fast["GI"][x] 
+        GI_values = np.vectorize(gi)(current_ranges)
+
+
+        A = (self.adc_mult / R_values)
+
+        results_without_gain = (adc_values - O_values) * A
+        
+        A = ( \
+            S_values \
+            * (self.current_vdd / 1000) \
+            + I_values) \
+
+        adc = UG_values \
+         * (results_without_gain \
+         * (GS_values \
+         * results_without_gain + GI_values) \
+         + A ) \
+
+        return adc
 
     def get_adc_result(self, current_range, adc_value):
         """Get result of adc conversion"""
         current_range = str(current_range)
         result_without_gain = (adc_value - self.modifiers["O"][current_range]) * (
             self.adc_mult / self.modifiers["R"][current_range])
-        adc = self.modifiers["UG"][current_range] * (result_without_gain * (self.modifiers["GS"][current_range] * result_without_gain + self.modifiers["GI"][current_range]) + (
-            self.modifiers["S"][current_range] * (self.current_vdd / 1000) + self.modifiers["I"][current_range]))
+        adc = self.modifiers["UG"][current_range] \
+         * (result_without_gain \
+         * (self.modifiers["GS"][current_range] \
+         * result_without_gain + self.modifiers["GI"][current_range]) \
+         + ( \
+            self.modifiers["S"][current_range] \
+            * (self.current_vdd / 1000) \
+            + self.modifiers["I"][current_range]) \
+            ) \
+
 
         prev_rolling_avg = self.rolling_avg
         prev_rolling_avg4 = self.rolling_avg4
@@ -316,6 +413,15 @@ class PPK2_API():
     def _digital_to_analog(self, adc_value):
         """Convert discrete value to analog value"""
         return int.from_bytes(adc_value, byteorder="little", signed=False)  # convert reading to analog value
+
+    def _digital_to_analog_fast(self, adc_values):
+        return np.frombuffer(adc_values, dtype=np.int32)
+
+    def get_samples_fast(self, buf):
+        sample_size = 4
+        int_samples = self._digital_to_analog_fast(buf)
+        samples = self._handle_raw_data_fast(int_samples)
+        return samples
 
     def get_samples(self, buf):
         """
